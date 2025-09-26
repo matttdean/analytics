@@ -1,9 +1,10 @@
-import { NextResponse, type NextRequest } from 'next/server'
 import { createServerClient, type CookieOptions } from '@supabase/ssr'
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
 
 export async function middleware(req: NextRequest) {
   const res = NextResponse.next()
-
+  
   // Supabase server client wired to middleware cookies
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -23,27 +24,57 @@ export async function middleware(req: NextRequest) {
     }
   )
 
-  // Only gate protected paths
-  const protectedPath =
-    req.nextUrl.pathname.startsWith('/dashboard') ||
-    req.nextUrl.pathname.startsWith('/api/data')
+  // If no session, redirect to login
+  const { data: { session } } = await supabase.auth.getSession()
+  if (!session) {
+    if (req.nextUrl.pathname.startsWith('/dashboard') || 
+        req.nextUrl.pathname.startsWith('/analytics') ||
+        req.nextUrl.pathname.startsWith('/search-console') ||
+        req.nextUrl.pathname.startsWith('/business-profile') ||
+        req.nextUrl.pathname.startsWith('/performance') ||
+        req.nextUrl.pathname.startsWith('/audience') ||
+        req.nextUrl.pathname.startsWith('/goals') ||
+        req.nextUrl.pathname.startsWith('/reports') ||
+        req.nextUrl.pathname.startsWith('/alerts') ||
+        req.nextUrl.pathname.startsWith('/settings') ||
+        req.nextUrl.pathname.startsWith('/help')) {
+      return NextResponse.redirect(new URL('/login', req.url))
+    }
+    return res
+  }
 
-  if (!protectedPath) return res
+  // If user is authenticated, check if they need onboarding
+  if (session.user) {
+    // Check if user has GA4 connection
+    const { data: ga4Connection } = await supabase
+      .from('ga4_connections')
+      .select('property_id')
+      .eq('user_id', session.user.id)
+      .maybeSingle()
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    const url = req.nextUrl.clone()
-    url.pathname = '/login'
-    url.searchParams.set('next', req.nextUrl.pathname) // optional: send them back after login
-    return NextResponse.redirect(url)
+    // Only redirect to onboarding for dashboard page if no GA4 connection
+    // Other pages can be accessed even without GA4 connection
+    if (!ga4Connection?.property_id && req.nextUrl.pathname === '/dashboard') {
+      return NextResponse.redirect(new URL('/onboarding', req.url))
+    }
   }
 
   return res
 }
 
 export const config = {
-  matcher: ['/dashboard/:path*', '/api/data/:path*'],
+  matcher: [
+    '/dashboard/:path*',
+    '/analytics/:path*',
+    '/search-console/:path*',
+    '/business-profile/:path*',
+    '/performance/:path*',
+    '/audience/:path*',
+    '/goals/:path*',
+    '/reports/:path*',
+    '/alerts/:path*',
+    '/settings/:path*',
+    '/help/:path*',
+    '/onboarding/:path*'
+  ],
 }

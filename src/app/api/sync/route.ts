@@ -13,13 +13,7 @@ type GA4Row = {
   total_revenue: number
 }
 
-type GSCRow = {
-  date: string
-  clicks: number
-  impressions: number
-  ctr: number
-  position: number
-}
+
 
 type GBPRow = {
   date: string
@@ -53,7 +47,7 @@ function toBuf(v: unknown): Buffer {
   throw new Error('Unsupported bytea format from Supabase')
 }
 
-// ----- Google fetchers (GA4 / GSC / GBP) -----
+// ----- Google fetchers (GA4 / GBP) -----
 async function fetchGA4(accessToken: string, propertyId: string, start: string, end: string): Promise<GA4Row[]> {
   const url = `https://analyticsdata.googleapis.com/v1beta/${propertyId}:runReport`
   const body = {
@@ -77,24 +71,7 @@ async function fetchGA4(accessToken: string, propertyId: string, start: string, 
   }))
 }
 
-async function fetchGSC(accessToken: string, siteUrl: string, start: string, end: string): Promise<GSCRow[]> {
-  const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`
-  const body = { startDate: start, endDate: end, dimensions: ['date'] }
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error(`GSC query failed: ${res.status}`)
-  const json = await res.json()
-  return (json.rows || []).map((r: any) => ({
-    date: r.keys[0] as string,
-    clicks: r.clicks || 0,
-    impressions: r.impressions || 0,
-    ctr: r.ctr || 0,
-    position: r.position || 0,
-  }))
-}
+
 
 function ymd(d: string) {
   const [y, m, dd] = d.split('-').map(Number)
@@ -138,41 +115,52 @@ async function getAccessTokenAdmin(userId: string): Promise<string> {
   const { data, error } = await ADMIN
     .from('google_oauth_tokens')
     .select(
-      'id, access_token_cipher, refresh_token_cipher, access_iv, access_tag, refresh_iv, refresh_tag, expiry'
+      'id, access_token_cipher, refresh_token_cipher, access_token_iv, access_token_tag, refresh_token_iv, refresh_token_tag, expiry'
     )
     .eq('user_id', userId)
     .maybeSingle()
 
   if (error || !data) throw new Error(`No Google tokens for user ${userId}`)
 
-  const accessPlain = decrypt(data.access_token_cipher, toBuf(data.access_iv as any), toBuf(data.access_tag as any))
-  const refreshPlain = decrypt(
-    data.refresh_token_cipher,
-    toBuf(data.refresh_iv as any),
-    toBuf(data.refresh_tag as any)
-  )
+  try {
+    const accessPlain = decrypt(
+      data.access_token_cipher, 
+      Buffer.from(data.access_token_iv, 'base64'), 
+      Buffer.from(data.access_token_tag, 'base64')
+    )
+    const refreshPlain = decrypt(
+      data.refresh_token_cipher,
+      Buffer.from(data.refresh_token_iv, 'base64'),
+      Buffer.from(data.refresh_token_tag, 'base64')
+    )
 
-  const expired = new Date(data.expiry).getTime() < Date.now() + 60_000
-  if (!expired) return accessPlain
+    const expired = new Date(data.expiry).getTime() < Date.now() + 60_000
+    if (!expired) return accessPlain
 
-  // refresh
-  const refreshed = await refreshAccessToken(refreshPlain)
-  const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
-  const encA = encrypt(refreshed.access_token)
+    // refresh
+    const refreshed = await refreshAccessToken(refreshPlain)
+    const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
+    const encA = encrypt(refreshed.access_token)
 
-  const { error: upErr } = await ADMIN
-    .from('google_oauth_tokens')
-    .update({
-      access_token_cipher: encA.cipher,
-      access_iv: hex(encA.iv),
-      access_tag: hex(encA.tag),
-      expiry: newExpiry,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', data.id)
+    const { error: upErr } = await ADMIN
+      .from('google_oauth_tokens')
+      .update({
+        access_token_cipher: encA.cipher,
+        access_token_iv: encA.iv.toString('base64'),
+        access_token_tag: encA.tag.toString('base64'),
+        access_iv: encA.iv.toString('base64'),
+        access_tag: encA.tag.toString('base64'),
+        expiry: newExpiry,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', data.id)
 
-  if (upErr) throw upErr
-  return refreshed.access_token
+    if (upErr) throw upErr
+    return refreshed.access_token
+  } catch (decryptError) {
+    console.error('Token decryption failed for user', userId, ':', decryptError)
+    throw new Error(`Token decryption failed for user ${userId}`)
+  }
 }
 
 // ----- Route Handler -----
@@ -220,25 +208,25 @@ export async function POST(req: Request) {
       }
     }
 
-    // GSC
-    const { data: gscc } = await ADMIN.from('gsc_connections').select('*').eq('user_id', userId)
-    for (const c of gscc || []) {
-      const rows: GSCRow[] = await fetchGSC(access, c.site_url, startStr, endStr)
-      if (rows.length) {
-        const payload = rows.map((r: GSCRow) => ({
-          user_id: userId,
-          site_url: c.site_url,
-          date: r.date,
-          clicks: r.clicks,
-          impressions: r.impressions,
-          ctr: r.ctr,
-          position: r.position,
-        }))
-        const { error } = await ADMIN.from('gsc_daily').upsert(payload)
-        if (error) throw error
-        changed += payload.length
-      }
-    }
+    // GSC - Temporarily disabled due to domain property limitations
+    // const { data: gscc } = await ADMIN.from('gsc_connections').select('*').eq('user_id', userId)
+    // for (const c of gscc || []) {
+    //   const rows: GSCRow[] = await fetchGSC(access, c.site_url, startStr, endStr)
+    //   if (rows.length) {
+    //     const payload = rows.map((r: GSCRow) => ({
+    //       user_id: userId,
+    //       site_url: c.site_url,
+    //       date: r.date,
+    //       clicks: r.clicks,
+    //       impressions: r.impressions,
+    //       ctr: r.ctr,
+    //       position: r.position,
+    //     }))
+    //     const { error } = await ADMIN.from('gsc_daily').upsert(payload)
+    //     if (error) throw error
+    //     changed += payload.length
+    //   }
+    // }
 
     // GBP
     const { data: gbpc } = await ADMIN.from('gbp_connections').select('*').eq('user_id', userId)

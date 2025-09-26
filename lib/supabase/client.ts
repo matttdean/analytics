@@ -12,13 +12,12 @@ export function createClient() {
 
   if (!url || !anon) throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY')
 
-  // Force implicit flow so magic links return #access_token (no PKCE)
+  // Use standard auth flow for better compatibility
   return createSupabaseClient(url, anon, {
     auth: {
-      flowType: 'implicit',
       autoRefreshToken: true,
       persistSession: true,
-      detectSessionInUrl: true, // auto-consume #access_token on /auth/callback
+      detectSessionInUrl: true,
     },
   })
 }

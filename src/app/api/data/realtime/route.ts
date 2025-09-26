@@ -1,41 +1,41 @@
 import { NextResponse } from 'next/server'
 import { createWritableClient } from '@/lib/supabase/server'
+import { decrypt } from '@/lib/crypto'
 
-// optional crypto (if you stored *_enc)
-let decrypt: ((val: any) => string) | null = null
-async function getDecrypt() {
-  if (decrypt) return decrypt
-  try {
-    const mod: any = await import('@/lib/crypto')
-    decrypt = mod.decrypt as (val: any) => string
-  } catch { /* no crypto module */ }
-  return decrypt
+function normalizePropertyId(raw?: string) {
+  if (!raw) throw new Error('missing_property')
+  const id = raw.startsWith('properties/') ? raw : `properties/${raw}`
+  const num = id.split('/')[1]
+  if (!/^\d+$/.test(num)) throw new Error(`invalid_property:${raw}`)
+  return id
 }
 
 async function readToken(supabase: any, userId: string) {
   const { data, error } = await supabase
     .from('google_oauth_tokens')
-    .select('access_token, access_token_enc, refresh_token, refresh_token_enc, expires_at')
+    .select('access_token_cipher, access_token_iv, access_token_tag, refresh_token_cipher, refresh_token_iv, refresh_token_tag, expiry')
     .eq('user_id', userId)
     .maybeSingle()
 
   if (error || !data) throw new Error('missing_google_tokens')
 
-  const dec = await getDecrypt()
-
-  const decryptMaybe = (enc?: string | null) => {
-    if (!enc) return undefined
-    if (!dec) return enc // plaintext in *_enc (or no decrypt module)
-    let parsed: any = enc
-    try { parsed = JSON.parse(enc) } catch { /* was plain string enc */ }
-    try { return dec(parsed) } catch { return enc }
+  try {
+    const access = decrypt(
+      data.access_token_cipher,
+      Buffer.from(data.access_token_iv, 'base64'),
+      Buffer.from(data.access_token_tag, 'base64')
+    )
+    const refresh = decrypt(
+      data.refresh_token_cipher,
+      Buffer.from(data.refresh_token_iv, 'base64'),
+      Buffer.from(data.refresh_token_tag, 'base64')
+    )
+    const expiresAt = data.expiry ? Date.parse(data.expiry) : 0
+    return { access, refresh, expiresAt }
+  } catch (decryptError) {
+    console.error('Token decryption failed:', decryptError)
+    throw new Error('token_decryption_failed')
   }
-
-  let access = data.access_token ?? decryptMaybe(data.access_token_enc)
-  let refresh = data.refresh_token ?? decryptMaybe(data.refresh_token_enc)
-  const expiresAt = data.expires_at ? Date.parse(data.expires_at) : 0
-
-  return { access, refresh, expiresAt }
 }
 
 async function refreshAccessToken(refreshToken: string) {
@@ -48,13 +48,13 @@ async function refreshAccessToken(refreshToken: string) {
 
   const r = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
   })
-  const j = await r.json()
-  if (!r.ok) {
-    throw new Error(`refresh_failed:${j?.error || r.status}`)
-  }
+  const text = await r.text()
+  let j: any = {}
+  try { j = text ? JSON.parse(text) : {} } catch {}
+  if (!r.ok) throw new Error(`refresh_failed:${j?.error || r.status}:${text?.slice(0,200)}`)
   return j as { access_token: string; expires_in: number; token_type: string }
 }
 
@@ -64,49 +64,60 @@ export async function GET(req: Request) {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 })
 
-    // Determine property ID (prefer saved connection, else ?property=123)
+    // Determine property: ?property=... OR stored default
     const url = new URL(req.url)
-    let property = url.searchParams.get('property') || undefined
-
-    if (!property) {
+    let propertyRaw = url.searchParams.get('property') || undefined
+    if (!propertyRaw) {
       const { data: conn } = await supabase
-        .from('ga4_connections')     // <-- if your table name differs, change this
+        .from('ga4_connections')
         .select('property_id')
         .eq('user_id', user.id)
-        .order('created_at', { ascending: false })
-        .limit(1)
         .maybeSingle()
-      property = (conn as any)?.property_id
+      propertyRaw = conn?.property_id
     }
+    const property = normalizePropertyId(propertyRaw)
 
-    if (!property) {
-      return NextResponse.json({ error: 'no_property_configured' }, { status: 400 })
-    }
-
+    // Load/refresh tokens
     const { access, refresh, expiresAt } = await readToken(supabase, user.id)
     let accessToken = access as string
-
-    // refresh if expiring (buffer 60s)
     if (!accessToken) throw new Error('no_access_token')
+
+    // refresh if near expiry (60s buffer)
     if (expiresAt && Date.now() > expiresAt - 60_000 && refresh) {
       const refreshed = await refreshAccessToken(refresh as string)
       accessToken = refreshed.access_token
       const newExpiresAt = new Date(Date.now() + (refreshed.expires_in || 3600) * 1000).toISOString()
-      // persist the new access token (plaintext or *_enc; we just store plaintext here)
-      await supabase
-        .from('google_oauth_tokens')
-        .update({ access_token: accessToken, expires_at: newExpiresAt })
-        .eq('user_id', user.id)
+
+      // persist updated access token (ignore failure silently, but log)
+      try {
+        const { encrypt } = await import('@/lib/crypto')
+        const encA = encrypt(refreshed.access_token)
+        const { error: upErr } = await supabase
+          .from('google_oauth_tokens')
+          .update({
+            access_token_cipher: encA.cipher,
+            access_token_iv: encA.iv.toString('base64'),
+            access_token_tag: encA.tag.toString('base64'),
+            // remove these if not real columns in your schema:
+            // access_iv: encA.iv.toString('base64'),
+            // access_tag: encA.tag.toString('base64'),
+            expiry: newExpiresAt
+          })
+          .eq('user_id', user.id)
+        if (upErr) console.warn('token update failed:', upErr)
+      } catch (e) {
+        console.warn('token update threw:', e)
+      }
     }
 
-    // GA4 Realtime API (last ~30 minutes)
+    // Call GA4 Realtime (v1beta)
     const resp = await fetch(
-      `https://analyticsdata.googleapis.com/v1beta/properties/${property}:runRealtimeReport`,
+      `https://analyticsdata.googleapis.com/v1beta/${property}:runRealtimeReport`,
       {
         method: 'POST',
         headers: {
-          authorization: `Bearer ${accessToken}`,
-          'content-type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           metrics: [{ name: 'activeUsers' }],
@@ -114,16 +125,22 @@ export async function GET(req: Request) {
       }
     )
 
-    const json = await resp.json()
+    const bodyText = await resp.text()
+    let json: any = {}
+    try { json = bodyText ? JSON.parse(bodyText) : {} } catch { /* HTML or plain text */ }
+
     if (!resp.ok) {
-      return NextResponse.json({ error: 'ga_realtime_failed', detail: json }, { status: resp.status })
+      console.error('GA4 realtime API error:', resp.status, bodyText?.slice(0, 500))
+      return NextResponse.json(
+        { error: 'ga_realtime_failed', status: resp.status, message: json?.error?.message || bodyText },
+        { status: resp.status }
+      )
     }
 
-    const value =
-      Number(json?.rows?.[0]?.metricValues?.[0]?.value ?? 0)
-
+    const value = Number(json?.rows?.[0]?.metricValues?.[0]?.value ?? 0)
     return NextResponse.json({ activeUsers: value, property })
   } catch (e: any) {
+    console.error('Realtime endpoint error:', e)
     return NextResponse.json({ error: e?.message || 'unknown_error' }, { status: 500 })
   }
 }

@@ -1,35 +1,35 @@
 'use client'
 
-import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
+import { Bell, Search, Menu } from 'lucide-react'
 
-export default function Topbar({ userEmail }: { userEmail?: string }) {
-  const router = useRouter()
-  const supabase = createClient()
-
-  async function signOut() {
-    await supabase.auth.signOut()
-    router.replace('/login')
-  }
-
+export default function Topbar() {
   return (
-    <header className="sticky top-0 z-10 flex items-center justify-between border-b bg-white/80 backdrop-blur px-6 py-3">
-      <div className="font-medium">
-        {process.env.NEXT_PUBLIC_APP_NAME ?? 'Dashboard'}
-      </div>
-      <div className="flex items-center gap-3">
-        <span className="text-sm text-zinc-600">
-          Signed in as{' '}
-          <span className="font-medium text-zinc-900">
-            {userEmail || '—'}
-          </span>
-        </span>
-        <button
-          onClick={signOut}
-          className="rounded-md border px-3 py-1.5 text-sm hover:bg-zinc-50"
-        >
-          Sign out
-        </button>
+    <header className="bg-white border-b border-gray-200 px-6 py-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <button className="lg:hidden p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors">
+            <Menu className="h-5 w-5" />
+          </button>
+          <h1 className="text-xl font-semibold text-gray-900">Dashboard</h1>
+        </div>
+
+        <div className="flex items-center gap-4">
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Search..."
+              className="pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            />
+          </div>
+
+          {/* Notifications */}
+          <button className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors relative">
+            <Bell className="h-5 w-5" />
+            <span className="absolute top-1 right-1 h-2 w-2 bg-red-500 rounded-full"></span>
+          </button>
+        </div>
       </div>
     </header>
   )

@@ -144,7 +144,7 @@ export async function GET(req: Request) {
       refresh_tag_b64 = existingRT.refresh_tag
     }
 
-    // 4) Upsert to your exact columns
+    // 4) Upsert to your exact columns - store as text to avoid bytea conversion issues
     const { error } = await supabase
       .from('google_oauth_tokens')
       .upsert(
@@ -156,17 +156,17 @@ export async function GET(req: Request) {
           access_token_cipher: access_cipher,
           refresh_token_cipher: refresh_cipher,
 
-          // IV/TAG columns (bytea, NOT NULL) — send base64; PostgREST stores as bytea
-          access_iv: access_iv_b64,
-          access_tag: access_tag_b64,
-          refresh_iv: refresh_iv_b64,
-          refresh_tag: refresh_tag_b64,
-
-          // Optional text IV/TAG columns — populate too for compatibility
+          // Store IV/TAG as text columns to avoid bytea conversion issues
           access_token_iv: access_iv_b64,
           access_token_tag: access_tag_b64,
           refresh_token_iv: refresh_iv_b64,
           refresh_token_tag: refresh_tag_b64,
+
+          // Also store in bytea columns for compatibility
+          access_iv: access_iv_b64,
+          access_tag: access_tag_b64,
+          refresh_iv: refresh_iv_b64,
+          refresh_tag: refresh_tag_b64,
 
           // Scopes & expiry
           scope: scopes,

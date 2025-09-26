@@ -61,65 +61,55 @@ export async function refreshAccessToken(refreshToken: string) {
   return res.json() as Promise<{ access_token: string; expires_in: number; scope?: string }>
 }
 
-/** Convert Supabase bytea returns (\"\\x...\" hex, base64, Buffer, or Uint8Array) to Buffer */
-function toBuf(v: unknown): Buffer {
-  if (v instanceof Uint8Array) return Buffer.from(v)
-  if (typeof v === 'string') {
-    if (v.startsWith('\\x') || v.startsWith('0x')) return Buffer.from(v.replace(/^\\x|^0x/, ''), 'hex')
-    // fallback assume base64
-    return Buffer.from(v, 'base64')
-  }
-  // Edge: { type: 'Buffer', data: number[] }
-  if (typeof v === 'object' && v && (v as any).type === 'Buffer' && Array.isArray((v as any).data)) {
-    return Buffer.from((v as any).data)
-  }
-  throw new Error('Unsupported bytea format from Supabase')
-}
-
-/** hex string for bytea insert via PostgREST */
-const hex = (b: Buffer) => '\\x' + b.toString('hex')
-
 export async function getAuthorizedAccessToken(userId: string) {
   const supabase = await createClient()
   const { data, error } = await supabase
     .from('google_oauth_tokens')
-    .select('id, access_token_cipher, refresh_token_cipher, access_iv, access_tag, refresh_iv, refresh_tag, expiry')
+    .select('id, access_token_cipher, refresh_token_cipher, access_token_iv, access_token_tag, refresh_token_iv, refresh_token_tag, expiry')
     .eq('user_id', userId)
     .maybeSingle()
 
   if (error || !data) throw new Error('No Google tokens on file')
 
-  const accessTokenPlain = decrypt(
-    data.access_token_cipher,
-    toBuf(data.access_iv as any),
-    toBuf(data.access_tag as any)
-  )
-  const refreshTokenPlain = decrypt(
-    data.refresh_token_cipher,
-    toBuf(data.refresh_iv as any),
-    toBuf(data.refresh_tag as any)
-  )
+  try {
+    const accessTokenPlain = decrypt(
+      data.access_token_cipher,
+      Buffer.from(data.access_token_iv, 'base64'),
+      Buffer.from(data.access_token_tag, 'base64')
+    )
+    const refreshTokenPlain = decrypt(
+      data.refresh_token_cipher,
+      Buffer.from(data.refresh_token_iv, 'base64'),
+      Buffer.from(data.refresh_token_tag, 'base64')
+    )
 
-  const isExpired = new Date(data.expiry).getTime() < Date.now() + 60_000
-  if (!isExpired) return accessTokenPlain
+    const isExpired = new Date(data.expiry).getTime() < Date.now() + 60_000
+    if (!isExpired) return accessTokenPlain
 
-  const refreshed = await refreshAccessToken(refreshTokenPlain)
-  const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
-  const encA = encrypt(refreshed.access_token)
+    // Token is expired, refresh it
+    const refreshed = await refreshAccessToken(refreshTokenPlain)
+    const newExpiry = new Date(Date.now() + refreshed.expires_in * 1000).toISOString()
+    const encA = encrypt(refreshed.access_token)
 
-  const { error: upErr } = await supabase
-    .from('google_oauth_tokens')
-    .update({
-      access_token_cipher: encA.cipher,
-      access_iv: hex(encA.iv),
-      access_tag: hex(encA.tag),
-      expiry: newExpiry,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', data.id)
+    const { error: upErr } = await supabase
+      .from('google_oauth_tokens')
+      .update({
+        access_token_cipher: encA.cipher,
+        access_token_iv: encA.iv.toString('base64'),
+        access_token_tag: encA.tag.toString('base64'),
+        access_iv: encA.iv.toString('base64'),
+        access_tag: encA.tag.toString('base64'),
+        expiry: newExpiry,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', data.id)
 
-  if (upErr) throw upErr
-  return refreshed.access_token
+    if (upErr) throw upErr
+    return refreshed.access_token
+  } catch (decryptError) {
+    console.error('Token decryption failed:', decryptError)
+    throw new Error('Token decryption failed - please reconnect your Google account')
+  }
 }
 
 export async function storeTokens(
@@ -138,11 +128,15 @@ export async function storeTokens(
     {
       user_id: userId,
       access_token_cipher: encA.cipher,
-      access_iv: hex(encA.iv),
-      access_tag: hex(encA.tag),
+      access_token_iv: encA.iv.toString('base64'),
+      access_token_tag: encA.tag.toString('base64'),
+      access_iv: encA.iv.toString('base64'),
+      access_tag: encA.tag.toString('base64'),
       refresh_token_cipher: encR.cipher,
-      refresh_iv: hex(encR.iv),
-      refresh_tag: hex(encR.tag),
+      refresh_token_iv: encR.iv.toString('base64'),
+      refresh_token_tag: encR.tag.toString('base64'),
+      refresh_iv: encR.iv.toString('base64'),
+      refresh_tag: encR.tag.toString('base64'),
       scope: scope.split(' '),
       expiry,
       updated_at: new Date().toISOString(),

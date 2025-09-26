@@ -2,66 +2,122 @@
 export const runtime = 'nodejs'
 import { NextResponse } from 'next/server'
 import { createWritableClient } from '@/lib/supabase/server'
+import { decrypt, encrypt } from '@/lib/crypto'
 
 export async function GET() {
-  const supabase = await createWritableClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 })
-
-  const { data } = await supabase
-    .from('google_oauth_tokens')
-    .select('refresh_token_cipher, refresh_iv, refresh_tag')
-    .eq('user_id', user.id)
-    .maybeSingle()
-
-  if (!data?.refresh_token_cipher) {
-    return NextResponse.json({ error: 'no_refresh_token' }, { status: 400 })
-  }
-
-  // decrypt refresh
-  let refresh = data.refresh_token_cipher
   try {
-    const mod: any = await import('@/lib/crypto')
-    if (data.refresh_iv && data.refresh_tag) {
-      const iv = Buffer.isBuffer(data.refresh_iv) ? data.refresh_iv.toString('base64') : String(data.refresh_iv)
-      const tag = Buffer.isBuffer(data.refresh_tag) ? data.refresh_tag.toString('base64') : String(data.refresh_tag)
-      refresh = mod.decrypt({ cipher: data.refresh_token_cipher, iv, tag })
+    const supabase = await createWritableClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return NextResponse.json({ error: 'unauthenticated' }, { status: 401 })
+
+    const { data, error } = await supabase
+      .from('google_oauth_tokens')
+      .select('refresh_token_cipher, refresh_token_iv, refresh_token_tag, access_token_cipher, access_token_iv, access_token_tag, expiry')
+      .eq('user_id', user.id)
+      .maybeSingle()
+
+    if (error) {
+      return NextResponse.json({ 
+        error: 'database_error', 
+        detail: error.message 
+      }, { status: 500 })
     }
-  } catch {}
 
-  const body = new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID ?? '',
-    client_secret: process.env.GOOGLE_CLIENT_SECRET ?? '',
-    refresh_token: refresh,
-    grant_type: 'refresh_token',
-  }).toString()
+    if (!data?.refresh_token_cipher) {
+      return NextResponse.json({ 
+        error: 'no_refresh_token',
+        message: 'No refresh token found - please reconnect your Google account'
+      }, { status: 400 })
+    }
 
-  const r = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
-  })
-  const j = await r.json().catch(() => ({}))
+    // Decrypt refresh token
+    let refreshToken = null
+    try {
+      refreshToken = decrypt(
+        data.refresh_token_cipher,
+        Buffer.from(data.refresh_token_iv, 'base64'),
+        Buffer.from(data.refresh_token_tag, 'base64')
+      )
+    } catch (e) {
+      return NextResponse.json({
+        error: 'decryption_failed',
+        detail: e instanceof Error ? e.message : 'Unknown decryption error',
+        message: 'Failed to decrypt refresh token - please reconnect your Google account'
+      }, { status: 400 })
+    }
 
-  if (!r.ok) return NextResponse.json({ ok: false, step: 'refresh', detail: j }, { status: r.status })
+    // Exchange refresh token for new access token
+    const body = new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID ?? '',
+      client_secret: process.env.GOOGLE_CLIENT_SECRET ?? '',
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }).toString()
 
-  // persist new access token (encrypt)
-  try {
-    const mod: any = await import('@/lib/crypto')
-    const out = mod.encrypt(j.access_token)
-    const ivB64 = Buffer.isBuffer(out.iv) ? out.iv.toString('base64') : String(out.iv)
-    const tagB64 = Buffer.isBuffer(out.tag) ? out.tag.toString('base64') : String(out.tag)
-    const expiry = new Date(Date.now() + (j.expires_in || 3600) * 1000).toISOString()
-    await supabase.from('google_oauth_tokens').update({
-      access_token_cipher: out.cipher,
-      access_iv: ivB64,
-      access_tag: tagB64,
-      access_token_iv: ivB64,
-      access_token_tag: tagB64,
-      expiry, expires_at: expiry,
-      updated_at: new Date().toISOString(),
-    } as any).eq('user_id', user.id)
-  } catch {}
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body,
+    })
+    
+    const tokenData = await res.json().catch(() => ({}))
 
-  return NextResponse.json({ ok: true, refreshed: true, token_type: j.token_type, expires_in: j.expires_in })
+    if (!res.ok) {
+      return NextResponse.json({ 
+        error: 'refresh_failed',
+        status: res.status,
+        detail: tokenData,
+        message: 'Failed to refresh token with Google'
+      }, { status: res.status })
+    }
+
+    // Encrypt and store new access token
+    try {
+      const encA = encrypt(tokenData.access_token)
+      const newExpiry = new Date(Date.now() + (tokenData.expires_in || 3600) * 1000).toISOString()
+      
+      const { error: updateError } = await supabase
+        .from('google_oauth_tokens')
+        .update({
+          access_token_cipher: encA.cipher,
+          access_token_iv: encA.iv.toString('base64'),
+          access_token_tag: encA.tag.toString('base64'),
+          access_iv: encA.iv.toString('base64'),
+          access_tag: encA.tag.toString('base64'),
+          expiry: newExpiry,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', user.id)
+
+      if (updateError) {
+        return NextResponse.json({
+          error: 'update_failed',
+          detail: updateError.message,
+          message: 'Failed to update token in database'
+        }, { status: 500 })
+      }
+
+      return NextResponse.json({ 
+        success: true,
+        refreshed: true,
+        token_type: tokenData.token_type,
+        expires_in: tokenData.expires_in,
+        new_expiry: newExpiry
+      })
+
+    } catch (encryptError) {
+      return NextResponse.json({
+        error: 'encryption_failed',
+        detail: encryptError instanceof Error ? encryptError.message : 'Unknown encryption error',
+        message: 'Failed to encrypt new access token'
+      }, { status: 500 })
+    }
+
+  } catch (error) {
+    console.error('Refresh token error:', error)
+    return NextResponse.json({
+      error: 'internal_error',
+      detail: error instanceof Error ? error.message : 'Unknown error'
+    }, { status: 500 })
+  }
 }
