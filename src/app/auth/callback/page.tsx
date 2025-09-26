@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import type { Session } from '@supabase/supabase-js'
@@ -33,7 +33,7 @@ async function syncServerSession(session?: Session) {
   return res.ok
 }
 
-export default function AuthCallbackPage() {
+function AuthCallbackContent() {
   const router = useRouter()
   const qp = useSearchParams()
 
@@ -87,5 +87,17 @@ export default function AuthCallbackPage() {
     <main className="min-h-dvh grid place-items-center p-6">
       <div className="text-sm text-zinc-600">Signing you in…</div>
     </main>
+  )
+}
+
+export default function AuthCallbackPage() {
+  return (
+    <Suspense fallback={
+      <main className="min-h-dvh grid place-items-center p-6">
+        <div className="text-sm text-zinc-600">Loading…</div>
+      </main>
+    }>
+      <AuthCallbackContent />
+    </Suspense>
   )
 }
